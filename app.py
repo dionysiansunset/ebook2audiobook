@@ -1,4 +1,4 @@
-import argparse, socket, multiprocessing, sys, uuid, copy, warnings, importlib
+import argparse, socket, multiprocessing, sys, uuid, copy, warnings, importlib, atexit, signal
 import importlib.util
 
 from pathlib import Path
@@ -9,6 +9,8 @@ from lib.conf_models import TTS_ENGINES, default_fine_tuned, default_engine_sett
 
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="jieba._compat")
+
+_registered_cleanup = False
 
 
 def init_multiprocessing():
@@ -87,6 +89,71 @@ def kill_previous_instances(script_name: str):
                 proc.wait(timeout=3)
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
+
+
+def cleanup_orphan_multiprocessing_helpers(script_dir: str) -> None:
+    psutil_spec = importlib.util.find_spec("psutil")
+    if psutil_spec is None:
+        return
+    psutil = importlib.import_module("psutil")
+    helper_python = os.path.join(script_dir, os.path.basename(python_env_dir), "bin", "python")
+    markers = (
+        "from multiprocessing.resource_tracker import main",
+        "from multiprocessing.spawn import spawn_main",
+    )
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline", "exe"]):
+        try:
+            cmdline = proc.info["cmdline"] or []
+            cmd_text = " ".join(cmdline)
+            exe = proc.info.get("exe") or ""
+            if proc.info["pid"] == os.getpid():
+                continue
+            if proc.info["ppid"] != 1:
+                continue
+            if not (exe == helper_python or helper_python in cmd_text):
+                continue
+            if not any(marker in cmd_text for marker in markers):
+                continue
+            print(f"[WARN] Reaping stale multiprocessing helper PID={proc.info['pid']}")
+            proc.kill()
+            proc.wait(timeout=3)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+
+def register_runtime_cleanup(context_obj) -> None:
+    global _registered_cleanup
+    if _registered_cleanup:
+        return
+    _registered_cleanup = True
+
+    def shutdown_context(*_args):
+        manager = getattr(context_obj, "manager", None)
+        if manager is None:
+            return
+        try:
+            manager.shutdown()
+        except Exception:
+            pass
+        proc = getattr(manager, "_process", None)
+        if proc and proc.is_alive():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    atexit.register(shutdown_context)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.getsignal(sig)
+
+        def handler(signum, frame, prev=previous):
+            shutdown_context()
+            if callable(prev):
+                prev(signum, frame)
+            else:
+                raise SystemExit(128 + signum)
+
+        signal.signal(sig, handler)
 
 
 def main() -> None:
@@ -386,6 +453,7 @@ SML tags available:
         args["script_mode"] = args["script_mode"] if args["script_mode"] else NATIVE
         args["share"] = args["share"] if args["share"] else False
         args["ebook_list"] = None
+        cleanup_orphan_multiprocessing_helpers(os.path.dirname(os.path.abspath(__file__)))
 
         print(f"v{prog_version} {args['script_mode']} mode")
 
@@ -403,6 +471,7 @@ SML tags available:
         import lib.core as c
 
         c.context = c.SessionContext() if c.context is None else c.context
+        register_runtime_cleanup(c.context)
         c.context_tracker = (
             c.SessionTracker() if c.context_tracker is None else c.context_tracker
         )

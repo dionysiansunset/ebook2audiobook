@@ -64,6 +64,32 @@ class DeviceInstaller():
         except PackageNotFoundError:
             return False
 
+    def normalize_torch_tag(self, tag:str)->tuple[str, str]:
+        if tag in torch_matrix:
+            return tag, ''
+        m = re.fullmatch(r'(cu|rocm)(\d+)', tag or '')
+        if not m:
+            return tag, ''
+        prefix, digits = m.groups()
+        try:
+            target = int(digits)
+        except ValueError:
+            return tag, ''
+        candidates = []
+        for key in torch_matrix.keys():
+            match = re.fullmatch(rf'{prefix}(\d+)', key)
+            if match:
+                candidates.append((int(match.group(1)), key))
+        if not candidates:
+            return tag, ''
+        lower_or_equal = [item for item in candidates if item[0] <= target]
+        if lower_or_equal:
+            normalized = max(lower_or_equal, key=lambda item: item[0])[1]
+        else:
+            normalized = min(candidates, key=lambda item: item[0])[1]
+        note = f"Normalized unsupported torch tag {tag} to {normalized}."
+        return normalized, note
+
     def detect_platform_tag(self)->str:
         if self.system == systems['WINDOWS']:
             return 'win'
@@ -1181,6 +1207,11 @@ class DeviceInstaller():
                     tag = device_info.get('tag')
                     if tag in ['unknown','unsupported']:
                         return 0
+                    normalized_tag, normalized_note = self.normalize_torch_tag(tag)
+                    if normalized_note:
+                        print(normalized_note)
+                        device_info['note'] = ' '.join(filter(None, [device_info.get('note', ''), normalized_note])).strip()
+                        tag = normalized_tag
                     torch_version_matrix = torch_matrix[tag]['base']
                     torch_version_current_full = self.get_package_version('torch')
                     torch_version_current_base = None
